@@ -1,44 +1,72 @@
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using HomeSec.Core.Models;
 
 namespace HomeSec.Core.Services;
 
 /// <summary>
-/// Auto-detects the local network subnet and gateway.
+/// Auto-detects local network subnets across all active interfaces.
 /// </summary>
 public sealed class SubnetDetector
 {
-    public (IPAddress Gateway, string SubnetCidr, IPAddress LocalIp) Detect()
+    /// <summary>
+    /// Returns all usable IPv4 subnets across every active, non-loopback interface.
+    /// Results are sorted so that Class C private networks appear first.
+    /// </summary>
+    public List<SubnetInfo> DetectAll()
     {
-        var bestInterface = GetBestNetworkInterface();
-        if (bestInterface is null)
-            throw new InvalidOperationException(
-                "No active network interface found. Please check your network connection.");
+        var subnets = new List<SubnetInfo>();
 
-        var ipProps = bestInterface.GetIPProperties();
-        var unicast = ipProps.UnicastAddresses
-            .FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork);
+        var interfaces = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(ni => ni.OperationalStatus == OperationalStatus.Up
+                         && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                         && ni.NetworkInterfaceType != NetworkInterfaceType.Tunnel);
 
-        if (unicast is null)
-            throw new InvalidOperationException(
-                "No IPv4 address found on the active network interface.");
+        foreach (var ni in interfaces)
+        {
+            var ipProps = ni.GetIPProperties();
 
-        var localIp = unicast.Address;
-        var mask = unicast.IPv4Mask;
-        var gateway = ipProps.GatewayAddresses
-            .FirstOrDefault(g => g.Address.AddressFamily == AddressFamily.InterNetwork)?.Address
-            ?? localIp;
+            foreach (var unicast in ipProps.UnicastAddresses
+                         .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork))
+            {
+                var localIp = unicast.Address;
+                var mask = unicast.IPv4Mask;
+                var networkAddress = GetNetworkAddress(localIp, mask);
+                int prefixLength = GetPrefixLength(mask);
 
-        var networkAddress = GetNetworkAddress(localIp, mask);
-        int prefixLength = GetPrefixLength(mask);
-        string cidr = $"{networkAddress}/{prefixLength}";
+                // Skip link-local (169.254.x.x) and loopback-like addresses
+                byte firstOctet = localIp.GetAddressBytes()[0];
+                if (firstOctet == 169 || firstOctet == 127)
+                    continue;
 
-        return (gateway, cidr, localIp);
+                var gateway = ipProps.GatewayAddresses
+                    .FirstOrDefault(g => g.Address.AddressFamily == AddressFamily.InterNetwork)?.Address
+                    ?? localIp;
+
+                subnets.Add(new SubnetInfo
+                {
+                    InterfaceName = ni.Name,
+                    InterfaceType = ni.NetworkInterfaceType.ToString(),
+                    LocalIp = localIp,
+                    Gateway = gateway,
+                    SubnetMask = mask,
+                    Cidr = $"{networkAddress}/{prefixLength}",
+                    PrefixLength = prefixLength,
+                    SpeedMbps = ni.Speed / 1_000_000
+                });
+            }
+        }
+
+        // Sort: Class C private first, then by speed descending
+        return subnets
+            .OrderByDescending(s => s.IsClassC)
+            .ThenByDescending(s => s.SpeedMbps)
+            .ToList();
     }
 
     /// <summary>
-    /// Enumerates all host IPs in the detected subnet (excluding network and broadcast).
+    /// Enumerates all host IPs in the given subnet (excluding network and broadcast).
     /// </summary>
     public IEnumerable<IPAddress> GetSubnetHosts(string cidr)
     {
@@ -46,6 +74,11 @@ public sealed class SubnetDetector
         var networkIp = IPAddress.Parse(parts[0]);
         int prefix = int.Parse(parts[1]);
         int hostBits = 32 - prefix;
+
+        // Guard against absurdly large scans (anything bigger than /16 = 65k hosts)
+        if (hostBits > 16)
+            hostBits = 16;
+
         uint hostCount = (1u << hostBits) - 2; // exclude network & broadcast
 
         var networkBytes = networkIp.GetAddressBytes();
@@ -65,18 +98,7 @@ public sealed class SubnetDetector
         }
     }
 
-    private static NetworkInterface? GetBestNetworkInterface()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(ni => ni.OperationalStatus == OperationalStatus.Up
-                         && ni.NetworkInterfaceType != NetworkInterfaceType.Loopback
-                         && ni.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
-            .OrderByDescending(ni => ni.Speed)
-            .ThenByDescending(ni => ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet ? 1 : 0)
-            .FirstOrDefault();
-    }
-
-    private static IPAddress GetNetworkAddress(IPAddress address, IPAddress mask)
+    internal static IPAddress GetNetworkAddress(IPAddress address, IPAddress mask)
     {
         var addrBytes = address.GetAddressBytes();
         var maskBytes = mask.GetAddressBytes();
@@ -86,7 +108,7 @@ public sealed class SubnetDetector
         return new IPAddress(result);
     }
 
-    private static int GetPrefixLength(IPAddress mask)
+    internal static int GetPrefixLength(IPAddress mask)
     {
         var bytes = mask.GetAddressBytes();
         int length = 0;
