@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>HomeSec.Core</RootNamespace>
+    <AssemblyName>HomeSec.Core</AssemblyName>
+  </PropertyGroup>
+
+</Project>
