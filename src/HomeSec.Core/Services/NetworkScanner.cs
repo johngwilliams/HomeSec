@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using HomeSec.Core.Models;
@@ -9,8 +11,9 @@ namespace HomeSec.Core.Services;
 /// </summary>
 public sealed class NetworkScanner
 {
-    private const int PingTimeoutMs = 1000;
-    private const int MaxConcurrentPings = 50;
+    private const int PingTimeoutMs = 500;
+    private const int DnsTimeoutMs = 1500;
+    private const int MaxConcurrentPings = 80;
 
     public event Action<string>? StatusUpdate;
 
@@ -19,19 +22,30 @@ public sealed class NetworkScanner
         CancellationToken cancellationToken = default)
     {
         var hostList = hosts.ToList();
-        var devices = new List<NetworkDevice>();
+        var devices = new ConcurrentBag<NetworkDevice>();
         var semaphore = new SemaphoreSlim(MaxConcurrentPings);
 
         StatusUpdate?.Invoke($"Scanning {hostList.Count} addresses...");
 
+        // Read the full ARP table once up front instead of per-host
+        var arpTable = ReadArpTable();
+
+        int completed = 0;
         var tasks = hostList.Select(async ip =>
         {
             await semaphore.WaitAsync(cancellationToken);
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var device = await ProbeHostAsync(ip);
-                return device;
+                var device = await ProbeHostAsync(ip, arpTable);
+                if (device is not null)
+                {
+                    devices.Add(device);
+                }
+
+                int done = Interlocked.Increment(ref completed);
+                if (done % 25 == 0)
+                    StatusUpdate?.Invoke($"Probed {done}/{hostList.Count} addresses ({devices.Count} found)...");
             }
             finally
             {
@@ -39,21 +53,15 @@ public sealed class NetworkScanner
             }
         });
 
-        var results = await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
 
-        foreach (var device in results)
-        {
-            if (device is not null)
-            {
-                devices.Add(device);
-            }
-        }
-
-        StatusUpdate?.Invoke($"Discovery complete: {devices.Count} devices found.");
-        return devices;
+        var result = devices.ToList();
+        StatusUpdate?.Invoke($"Discovery complete: {result.Count} devices found.");
+        return result;
     }
 
-    private static async Task<NetworkDevice?> ProbeHostAsync(IPAddress ip)
+    private static async Task<NetworkDevice?> ProbeHostAsync(
+        IPAddress ip, Dictionary<string, string> arpTable)
     {
         try
         {
@@ -63,18 +71,11 @@ public sealed class NetworkScanner
             if (reply.Status != IPStatus.Success)
                 return null;
 
-            string? hostname = null;
-            try
-            {
-                var hostEntry = await Dns.GetHostEntryAsync(ip);
-                hostname = hostEntry.HostName;
-            }
-            catch
-            {
-                // DNS reverse lookup failed — not critical
-            }
+            // DNS reverse lookup with a hard timeout so it can't hang
+            string? hostname = await DnsLookupWithTimeoutAsync(ip);
 
-            string? mac = GetMacFromArpCache(ip);
+            // Fast ARP lookup from pre-read table
+            arpTable.TryGetValue(ip.ToString(), out string? mac);
 
             return new NetworkDevice
             {
@@ -89,44 +90,69 @@ public sealed class NetworkScanner
         }
     }
 
-    /// <summary>
-    /// Attempts to read the MAC address from the OS ARP cache via the
-    /// .NET NetworkInformation layer. Falls back to null if unavailable.
-    /// </summary>
-    private static string? GetMacFromArpCache(IPAddress ip)
+    private static async Task<string?> DnsLookupWithTimeoutAsync(IPAddress ip)
     {
-        // On Windows we can read ARP via "arp -a" or P/Invoke SendARP.
-        // Using a simple process call here for portability within Windows.
         try
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("arp", $"-a {ip}")
+            using var cts = new CancellationTokenSource(DnsTimeoutMs);
+            var task = Dns.GetHostEntryAsync(ip.ToString(), cts.Token);
+            var entry = await task;
+            // Don't return the IP address string as the hostname
+            if (entry.HostName != ip.ToString())
+                return entry.HostName;
+        }
+        catch
+        {
+            // Timeout or lookup failed — not critical
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Reads the entire ARP table once via "arp -a" and returns
+    /// a dictionary of IP → MAC address.
+    /// </summary>
+    private static Dictionary<string, string> ReadArpTable()
+    {
+        var table = new Dictionary<string, string>();
+        try
+        {
+            var psi = new ProcessStartInfo("arp", "-a")
             {
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
-            using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc is null) return null;
+            using var proc = Process.Start(psi);
+            if (proc is null) return table;
 
             string output = proc.StandardOutput.ReadToEnd();
-            proc.WaitForExit();
+            proc.WaitForExit(3000);
 
-            // Parse the ARP output for a MAC address pattern
             foreach (var line in output.Split('\n'))
             {
-                if (!line.Contains(ip.ToString())) continue;
-                var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                var parts = line.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2) continue;
+
+                // Find a MAC-shaped token (xx-xx-xx-xx-xx-xx or xx:xx:xx:xx:xx:xx)
+                string? ip = null;
+                string? mac = null;
                 foreach (var part in parts)
                 {
-                    if (part.Count(c => c == '-') == 5 || part.Count(c => c == ':') == 5)
-                        return part.Trim().ToUpperInvariant();
+                    if (IPAddress.TryParse(part, out _) && ip is null)
+                        ip = part;
+                    else if ((part.Count(c => c == '-') == 5 || part.Count(c => c == ':') == 5) && mac is null)
+                        mac = part.Trim().ToUpperInvariant();
                 }
+
+                if (ip is not null && mac is not null)
+                    table[ip] = mac;
             }
         }
         catch
         {
-            // ARP lookup failed — not critical
+            // ARP read failed — not critical
         }
-        return null;
+        return table;
     }
 }

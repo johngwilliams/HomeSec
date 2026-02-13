@@ -9,8 +9,10 @@ namespace HomeSec.Core.Services;
 /// </summary>
 public sealed class PortScanner
 {
-    private const int ConnectTimeoutMs = 800;
-    private const int MaxConcurrentConnections = 30;
+    private const int ConnectTimeoutMs = 600;
+    private const int BannerTimeoutMs = 400;
+    private const int MaxConcurrentPerDevice = 30;
+    private const int MaxConcurrentDevices = 4;
 
     /// <summary>
     /// Common ports to scan on home network devices.
@@ -52,13 +54,42 @@ public sealed class PortScanner
 
     public event Action<string>? StatusUpdate;
 
+    /// <summary>
+    /// Scan all devices in parallel (up to MaxConcurrentDevices at a time).
+    /// </summary>
+    public async Task ScanAllDevicesAsync(
+        IList<NetworkDevice> devices,
+        Action<int>? onDeviceComplete = null,
+        CancellationToken cancellationToken = default)
+    {
+        var semaphore = new SemaphoreSlim(MaxConcurrentDevices);
+        int completed = 0;
+
+        var tasks = devices.Select(async device =>
+        {
+            await semaphore.WaitAsync(cancellationToken);
+            try
+            {
+                await ScanDeviceAsync(device, cancellationToken);
+                int done = Interlocked.Increment(ref completed);
+                onDeviceComplete?.Invoke(done);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+    }
+
     public async Task ScanDeviceAsync(
         NetworkDevice device,
         CancellationToken cancellationToken = default)
     {
         StatusUpdate?.Invoke($"Port scanning {device.IpAddress}...");
 
-        var semaphore = new SemaphoreSlim(MaxConcurrentConnections);
+        var semaphore = new SemaphoreSlim(MaxConcurrentPerDevice);
         var tasks = CommonPorts.Select(async port =>
         {
             await semaphore.WaitAsync(cancellationToken);
@@ -76,33 +107,22 @@ public sealed class PortScanner
         device.OpenPorts = results.Where(p => p is not null).Cast<PortInfo>().ToList();
     }
 
-    public async Task ScanAllDevicesAsync(
-        IEnumerable<NetworkDevice> devices,
-        CancellationToken cancellationToken = default)
-    {
-        foreach (var device in devices)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await ScanDeviceAsync(device, cancellationToken);
-        }
-    }
-
     private static async Task<PortInfo?> CheckPortAsync(IPAddress ip, int port)
     {
         try
         {
-            using var client = new TcpClient();
-            using var cts = new CancellationTokenSource(ConnectTimeoutMs);
+            using var client = new TcpClient { LingerState = new LingerOption(true, 0) };
+            using var connectCts = new CancellationTokenSource(ConnectTimeoutMs);
 
-            await client.ConnectAsync(ip, port, cts.Token);
+            await client.ConnectAsync(ip, port, connectCts.Token);
 
             string? banner = null;
             try
             {
                 var stream = client.GetStream();
-                stream.ReadTimeout = 500;
+                using var bannerCts = new CancellationTokenSource(BannerTimeoutMs);
                 var buffer = new byte[256];
-                int read = await stream.ReadAsync(buffer.AsMemory(0, 256), cts.Token);
+                int read = await stream.ReadAsync(buffer.AsMemory(0, 256), bannerCts.Token);
                 if (read > 0)
                     banner = System.Text.Encoding.ASCII.GetString(buffer, 0, read).Trim();
             }

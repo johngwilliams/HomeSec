@@ -38,8 +38,22 @@ public partial class MainViewModel : ObservableObject
 
     public MainViewModel()
     {
-        _networkScanner.StatusUpdate += msg => Application.Current.Dispatcher.Invoke(() => StatusText = msg);
-        _portScanner.StatusUpdate += msg => Application.Current.Dispatcher.Invoke(() => StatusText = msg);
+        _networkScanner.StatusUpdate += OnStatus;
+        _portScanner.StatusUpdate += OnStatus;
+    }
+
+    private void OnStatus(string msg)
+    {
+        Application.Current.Dispatcher.BeginInvoke(() => StatusText = msg);
+    }
+
+    private void SetProgress(double value, string? text = null)
+    {
+        Application.Current.Dispatcher.BeginInvoke(() =>
+        {
+            ScanProgress = value;
+            if (text is not null) ScanProgressText = text;
+        });
     }
 
     [RelayCommand(CanExecute = nameof(CanStartScan))]
@@ -51,62 +65,64 @@ public partial class MainViewModel : ObservableObject
         SelectedDevice = null;
         ScanProgress = 0;
 
+        var token = _cts.Token;
+
         try
         {
-            // Phase 1: Detect subnet
-            ScanProgressText = "Detecting network...";
-            StatusText = "Detecting local network configuration...";
-            var (gateway, cidr, localIp) = _subnetDetector.Detect();
-            SubnetInfo = $"{cidr}  |  Gateway: {gateway}  |  Your IP: {localIp}";
-            ScanProgress = 5;
-
-            // Phase 2: Discover devices
-            ScanProgressText = "Discovering devices...";
-            var hosts = _subnetDetector.GetSubnetHosts(cidr).ToList();
-            var devices = await _networkScanner.DiscoverDevicesAsync(hosts, _cts.Token);
-
-            // Mark the gateway
-            var gatewayDevice = devices.FirstOrDefault(d => d.IpAddress.Equals(gateway));
-            if (gatewayDevice is not null)
-                gatewayDevice.IsGateway = true;
-
-            ScanProgress = 40;
-
-            // Phase 3: Port scan each device
-            ScanProgressText = "Scanning ports...";
-            int scanned = 0;
-            foreach (var device in devices)
+            // Run the entire scan pipeline on a background thread
+            var devices = await Task.Run(async () =>
             {
-                _cts.Token.ThrowIfCancellationRequested();
-                await _portScanner.ScanDeviceAsync(device, _cts.Token);
-                scanned++;
-                ScanProgress = 40 + (40.0 * scanned / devices.Count);
-            }
+                // Phase 1: Detect subnet
+                SetProgress(2, "Detecting network...");
+                var (gateway, cidr, localIp) = _subnetDetector.Detect();
+                Application.Current.Dispatcher.BeginInvoke(() =>
+                    SubnetInfo = $"{cidr}  |  Gateway: {gateway}  |  Your IP: {localIp}");
+                SetProgress(5);
 
-            // Phase 4: Classify devices
-            ScanProgressText = "Classifying devices...";
-            _classifier.ClassifyAll(devices);
-            ScanProgress = 85;
+                // Phase 2: Discover devices (ping sweep)
+                SetProgress(5, "Discovering devices...");
+                var hosts = _subnetDetector.GetSubnetHosts(cidr).ToList();
+                var found = await _networkScanner.DiscoverDevicesAsync(hosts, token);
 
-            // Phase 5: Security analysis
-            ScanProgressText = "Analyzing security...";
-            _analyzer.AnalyzeAll(devices);
-            ScanProgress = 95;
+                var gatewayDevice = found.FirstOrDefault(d => d.IpAddress.Equals(gateway));
+                if (gatewayDevice is not null)
+                    gatewayDevice.IsGateway = true;
 
-            // Populate the UI collection
+                SetProgress(40, $"Found {found.Count} devices. Scanning ports...");
+
+                // Phase 3: Port scan all devices in parallel
+                await _portScanner.ScanAllDevicesAsync(found, done =>
+                {
+                    double pct = 40 + (40.0 * done / found.Count);
+                    SetProgress(pct, $"Port scanning... ({done}/{found.Count})");
+                }, token);
+
+                SetProgress(85, "Classifying devices...");
+
+                // Phase 4: Classify
+                _classifier.ClassifyAll(found);
+                SetProgress(90, "Analyzing security...");
+
+                // Phase 5: Security analysis
+                _analyzer.AnalyzeAll(found);
+                SetProgress(95);
+
+                return found;
+            }, token);
+
+            // Back on UI thread — populate the list
             foreach (var device in devices.OrderByDescending(d => d.IsGateway)
                                           .ThenByDescending(d => d.Findings.Count)
                                           .ThenBy(d => d.IpAddress.ToString()))
             {
-                var vm = new DeviceViewModel(device);
-                Devices.Add(vm);
+                Devices.Add(new DeviceViewModel(device));
             }
 
             UpdateSummary(devices);
-
             ScanProgress = 100;
             ScanProgressText = "Scan complete";
-            StatusText = $"Scan complete — {devices.Count} devices found, {devices.Sum(d => d.Findings.Count)} security findings.";
+            StatusText = $"Scan complete — {devices.Count} devices found, " +
+                         $"{devices.Sum(d => d.Findings.Count)} security findings.";
         }
         catch (OperationCanceledException)
         {
