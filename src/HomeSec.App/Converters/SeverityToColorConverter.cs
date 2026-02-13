@@ -47,16 +47,28 @@ public class SeverityToBackgroundConverter : IValueConverter
 public class BoolToVisibilityConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
-        => value is true ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+        => IsTruthy(value) ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
         => throw new NotImplementedException();
+
+    internal static bool IsTruthy(object? value) => value switch
+    {
+        null => false,
+        bool b => b,
+        int i => i != 0,
+        double d => d != 0,
+        string s => s.Length > 0,
+        _ => true   // any non-null object (e.g. SelectedDevice) is truthy
+    };
 }
 
 public class InverseBoolToVisibilityConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
-        => value is true ? System.Windows.Visibility.Collapsed : System.Windows.Visibility.Visible;
+        => BoolToVisibilityConverter.IsTruthy(value)
+            ? System.Windows.Visibility.Collapsed
+            : System.Windows.Visibility.Visible;
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
         => throw new NotImplementedException();
